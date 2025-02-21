@@ -14,12 +14,13 @@ function make_opaque_closure(interp, typ, name, meth_nargs::Int, isva, lno, ci, 
             ocm = ccall(:jl_new_opaque_closure_from_code_info, Any, (Any, Any, Any, Any, Any, Cint, Any, Cint, Cint, Any),
                 typ, Union{}, rettype, @__MODULE__, ci, lno.line, lno.file, meth_nargs, isva, ()).source
         end
-        return Expr(:new_opaque_closure, typ, Union{}, Any, ocm, revs...)
     else
         oc_nargs = Int64(meth_nargs)
-        Expr(:new_opaque_closure, typ, Union{}, Any,
-            Expr(:opaque_closure_method, name, oc_nargs, isva, lno, ci), revs...)
+        ocm = Expr(:opaque_closure_method, name, oc_nargs, isva, lno, ci)
     end
+    oc = Expr(:new_opaque_closure, typ, Union{}, Any, true, ocm, revs...)
+    @static VERSION < v"1.12.0-DEV.691" ? deleteat!(oc.args, 4) : nothing
+    oc
 end
 
 function diffract_ir!(ir, ci, meth, sparams::Core.SimpleVector, nargs::Int, N::Int, interp=nothing, curs=nothing)
@@ -288,6 +289,8 @@ function diffract_ir!(ir, ci, meth, sparams::Core.SimpleVector, nargs::Int, N::I
             if isa(stmt, Core.ReturnNode)
                 accum!(stmt.val, Argument(2))
                 current_env = nothing
+            elseif is_global_access(ir, stmt)
+                # Treat it as a GlobalRef, dropping gradients.
             elseif isexpr(stmt, :call) || isexpr(stmt, :invoke)
                 Δ = do_accum(SSAValue(i))
                 callee = retrieve_ctx_obj(current_env, i)
@@ -452,7 +455,9 @@ function diffract_ir!(ir, ci, meth, sparams::Core.SimpleVector, nargs::Int, N::I
             end
             stmt = urs[]
 
-            if isexpr(stmt, :call)
+            if is_global_access(ir, stmt)
+                fwds[i] = ZeroTangent()
+            elseif isexpr(stmt, :call)
                 callee = insert_node_here!(Expr(:call, getfield, Argument(1), i))
                 pushfirst!(stmt.args, callee)
                 call = insert_node_here!(stmt)
@@ -564,7 +569,7 @@ function diffract_ir!(ir, ci, meth, sparams::Core.SimpleVector, nargs::Int, N::I
         if isexpr(stmt, :(=))
             stmt = stmt.args[2]
         end
-        if isexpr(stmt, :call)
+        if isexpr(stmt, :call) && !is_global_access(compact, stmt)
             compact[SSAValue(idx)] = Expr(:call, ∂⃖{N}(), stmt.args...)
             if isexpr(orig_stmt, :(=))
                 orig_stmt.args[2] = stmt
@@ -675,4 +680,19 @@ function diffract_ir!(ir, ci, meth, sparams::Core.SimpleVector, nargs::Int, N::I
     CC.verify_ir(ir, true, true)
 
     return ir
+end
+
+eval_globalref(x) = x
+eval_globalref(x::GlobalRef) = getglobal(x.mod, x.name)
+ssa_def(ir, idx::SSAValue) = ssa_def(ir, ir[idx][:inst])
+ssa_def(ir, def) = def
+
+function is_global_access(ir::Union{IRCode,IncrementalCompact}, stmt)
+    isexpr(stmt, :call, 3) || return false
+    f = eval_globalref(ssa_def(ir, stmt.args[1]))
+    f === getproperty || return false
+    from = eval_globalref(ssa_def(ir, stmt.args[2]))
+    isa(from, Module) || return false
+    name = stmt.args[3]
+    isa(name, QuoteNode) && isa(name.value, Symbol)
 end

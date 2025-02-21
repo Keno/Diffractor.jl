@@ -260,7 +260,7 @@ function forward_diff_no_inf!(ir::IRCode, to_diff::Vector{Pair{SSAValue,Int}};
             # TODO: Should we remember whether the callbacks wanted the arg?
             return transform!(ir, arg, order, maparg)
         elseif isa(arg, GlobalRef)
-            @assert isconst(arg)
+            @assert isconst(arg.mod, arg.name)
             return zero_bundle{order}()(getfield(arg.mod, arg.name))
         elseif isa(arg, QuoteNode)
             return zero_bundle{order}()(arg.value)
@@ -352,11 +352,11 @@ function forward_diff!(interp::ADInterpreter, ir::IRCode, src::CodeInfo, mi::Met
         end
     end
 
-    method_info = CC.MethodInfo(src)
+    info = @static VERSION ≥ v"1.12.0-DEV.1293" ? CC.SpecInfo(src) : CC.MethodInfo(src)
     argtypes = ir.argtypes[1:mi.def.nargs]
     world = get_inference_world(interp)
-    irsv = IRInterpretationState(interp, method_info, ir, mi, argtypes, world, src.min_world, src.max_world)
-    rt = CC._ir_abstract_constant_propagation(interp, irsv)
+    irsv = IRInterpretationState(interp, info, ir, mi, argtypes, world, src.min_world, src.max_world)
+    rt = CC.ir_abstract_constant_propagation(interp, irsv)
 
     ir = compact!(ir)
 
